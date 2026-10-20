@@ -4,6 +4,10 @@
 
 ### Features Added
 
+- Added `FoundryStateStore.resolved_descriptor` to inspect the metadata resolved
+  by `get_or_create` without a second read. Explicit `get()` calls still fetch
+  current metadata.
+
 ### Breaking Changes
 
 ### Bugs Fixed

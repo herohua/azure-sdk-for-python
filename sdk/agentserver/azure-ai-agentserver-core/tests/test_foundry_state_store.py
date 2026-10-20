@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 from pathlib import Path
@@ -171,7 +172,7 @@ async def test_get_or_create_returns_existing_store_when_present(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("FOUNDRY_HOSTING_ENVIRONMENT", "1")
-    info = _state_store()
+    info = _state_store(user_isolation=True, item_ttl_seconds=600)
     fetch = AsyncMock(return_value=info)
     create = AsyncMock()
     monkeypatch.setattr(FoundryStateStore, "_fetch_properties", fetch)
@@ -184,6 +185,7 @@ async def test_get_or_create_returns_existing_store_when_present(
         fetch.assert_awaited_once()
         create.assert_not_awaited()
         assert store.name == "checkpoints"
+        assert store.resolved_descriptor is info
     finally:
         await store.aclose()
 
@@ -206,6 +208,7 @@ async def test_get_or_create_creates_store_when_absent(
         fetch.assert_awaited_once()
         create.assert_awaited_once()
         assert store.name == "checkpoints"
+        assert store.resolved_descriptor is info
     finally:
         await store.aclose()
 
@@ -215,7 +218,7 @@ async def test_get_or_create_refetches_when_create_races_with_another_caller(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("FOUNDRY_HOSTING_ENVIRONMENT", "1")
-    created_elsewhere = _state_store()
+    created_elsewhere = _state_store(user_isolation=True, item_ttl_seconds=600)
     fetch = AsyncMock(
         side_effect=[FoundryStorageNotFoundError("not found"), created_elsewhere]
     )
@@ -230,6 +233,7 @@ async def test_get_or_create_refetches_when_create_races_with_another_caller(
         assert fetch.await_count == 2
         create.assert_awaited_once()
         assert store.name == "checkpoints"
+        assert store.resolved_descriptor is created_elsewhere
     finally:
         await store.aclose()
 
@@ -801,6 +805,10 @@ async def test_get_or_create_uses_file_backend_outside_hosting_even_with_endpoin
     async with reopened:
         item = await reopened.get_item("step/1")
 
+    assert store.resolved_descriptor is not None
+    assert reopened.resolved_descriptor == store.resolved_descriptor
+    assert reopened.resolved_descriptor.user_isolation is True
+    assert reopened.resolved_descriptor.item_ttl_seconds == -1
     assert created.key == "step/1"
     assert item is not None
     assert item.value == {"done": False}
@@ -899,3 +907,68 @@ async def test_local_backend_reuses_persisted_store_ttl(
         item = await reopened.get_item("permanent")
 
     assert item is not None
+
+
+@pytest.mark.asyncio
+async def test_resolved_descriptor_does_not_replace_explicit_fresh_get(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("FOUNDRY_HOSTING_ENVIRONMENT", "1")
+    first = _state_store(description="first")
+    current = _state_store(description="changed")
+    fetch = AsyncMock(side_effect=[first, current])
+    monkeypatch.setattr(FoundryStateStore, "_fetch_properties", fetch)
+    store = await FoundryStateStore.get_or_create(
+        "checkpoints", credential=MagicMock(), endpoint=_ENDPOINT
+    )
+    async with store:
+        assert store.resolved_descriptor is first
+        assert await store.get() is current
+        assert store.resolved_descriptor is first
+        assert fetch.await_count == 2
+
+
+def test_direct_constructor_has_no_resolved_descriptor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("FOUNDRY_HOSTING_ENVIRONMENT", raising=False)
+    monkeypatch.setenv("AGENTSERVER_STATE_ROOT", str(tmp_path))
+    assert FoundryStateStore("unresolved").resolved_descriptor is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stage", ["fetch", "create", "refetch"])
+@pytest.mark.parametrize("error_type", [RuntimeError, asyncio.CancelledError])
+async def test_resolution_failure_closes_transport_and_owned_credential(
+    monkeypatch: pytest.MonkeyPatch,
+    stage: str,
+    error_type: type[BaseException],
+) -> None:
+    from azure.ai.agentserver.core.storage._client import FoundryStorageClient
+
+    monkeypatch.setenv("FOUNDRY_HOSTING_ENVIRONMENT", "1")
+    credential = MagicMock()
+    credential.close = AsyncMock()
+    monkeypatch.setattr("azure.identity.aio.DefaultAzureCredential", lambda: credential)
+    error = error_type("resolution failed")
+    fetch = AsyncMock(
+        side_effect=error
+        if stage == "fetch"
+        else [
+            FoundryStorageNotFoundError("missing"),
+            error,
+        ]
+    )
+    create = AsyncMock(
+        side_effect=error if stage == "create" else FoundryStorageConflictError("raced")
+    )
+    monkeypatch.setattr(FoundryStateStore, "_fetch_properties", fetch)
+    monkeypatch.setattr(FoundryStateStore, "_create_properties", create)
+    close_pipeline = AsyncMock()
+    monkeypatch.setattr(FoundryStorageClient, "aclose", close_pipeline)
+    with pytest.raises(error_type) as raised:
+        await FoundryStateStore.get_or_create("checkpoints", endpoint=_ENDPOINT)
+    assert raised.value is error
+    close_pipeline.assert_awaited_once()
+    credential.close.assert_awaited_once()

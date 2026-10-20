@@ -132,6 +132,7 @@ class FoundryStateStore(FoundryStorageClient):
         """
         if not name:
             raise ValueError("name must be a non-empty string")
+        self._resolved_descriptor: StateStore | None = None
         self._local_backend: LocalStateStoreBackend | None = None
         if not os.environ.get(_FOUNDRY_HOSTING_ENVIRONMENT):
             local_path = (
@@ -204,6 +205,20 @@ class FoundryStateStore(FoundryStorageClient):
     def name(self) -> str:
         """Return the logical store name bound to this client."""
         return self._name
+
+    @property
+    def resolved_descriptor(self) -> StateStore | None:
+        """Return the descriptor resolved by :meth:`get_or_create`, without I/O.
+
+        This is the fetch, create, or conflict-refetch result from that
+        acquisition, including for local storage. It is ``None`` for clients
+        constructed directly. It is not refreshed by subsequent operations;
+        use :meth:`get` for current metadata.
+
+        :return: The acquisition descriptor, or ``None`` before resolution.
+        :rtype: ~azure.ai.agentserver.core.storage.StateStore or None
+        """
+        return self._resolved_descriptor
 
     def _store_path(self) -> str:
         return f"state_stores/{_encode_segment(self._name)}"
@@ -282,7 +297,9 @@ class FoundryStateStore(FoundryStorageClient):
         :paramtype user_id: str or None
         :keyword api_version: Storage API version.
         :paramtype api_version: str
-        :return: The bound, ready-to-use store client.
+        :return: The bound, ready-to-use store client. Its
+            :attr:`resolved_descriptor` exposes the metadata from this
+            acquisition without another fetch.
         :rtype: FoundryStateStore
         """
         store = cls(
@@ -297,17 +314,17 @@ class FoundryStateStore(FoundryStorageClient):
             api_version=api_version,
             **kwargs,
         )
-        if store._local_backend is not None:
-            store._local_backend.ensure_store()
-            return store
         try:
+            if store._local_backend is not None:
+                store._resolved_descriptor = store._local_backend.ensure_store()
+                return store
             try:
-                await store._fetch_properties()
+                store._resolved_descriptor = await store._fetch_properties()
             except FoundryStorageNotFoundError:
                 try:
-                    await store._create_properties()
+                    store._resolved_descriptor = await store._create_properties()
                 except FoundryStorageConflictError:
-                    await store._fetch_properties()
+                    store._resolved_descriptor = await store._fetch_properties()
         except BaseException:
             # Never leak the pipeline (or an owned DefaultAzureCredential) when
             # resolution fails: the caller never receives ``store`` and so has
